@@ -772,7 +772,7 @@ export class CdkOceanAgentStack extends cdk.Stack {
         role: roleLambdaWebsocket,
         code: lambda.DockerImageCode.fromImageAsset(path.join(__dirname, '../../lambda-document-manager')),
         timeout: cdk.Duration.seconds(600),
-        memorySize: 8192,
+        memorySize: 2048,
         environment: {
           s3_bucket: s3Bucket.bucketName,
           s3_prefix: s3_prefix,
