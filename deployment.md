@@ -11,7 +11,7 @@ LLM으로 Anthropic의 Claude 3을 사용하기 위하여, Amazon Bedrock의 us-
 Cloud9이 Deprecated될 예정이므로 EC2를 사용하여 설치하는것을 추천 드립니다. 기존 계정의 경우에 Cloud9을 계속 사용할 수 있습니다.
 
 
-### EC2를 사용하는 경우
+### EC2를 사용하여 설치 환경 구성하기
 
 여기서는 편의상 us-west-2 (Oregon) 리전을 사용합니다.
 
