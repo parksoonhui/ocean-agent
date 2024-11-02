@@ -49,6 +49,7 @@ sudo service docker start
 sudo npm install -g aws-cdk --prefix /usr/local
 ```
 
+<!--
 
 ### Cloud9을 사용하는 경우
 
@@ -74,6 +75,7 @@ curl https://raw.githubusercontent.com/kyopark2014/technical-summary/main/resize
 ```text
 chmod a+rx resize.sh && ./resize.sh 80
 ```
+-->
 
 ### 소스 다운로드 및 설치 
 
