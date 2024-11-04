@@ -34,7 +34,7 @@ s3_prefix = os.environ.get('s3_prefix')
 
 meta_prefix = "metadata/"
 enableParallelSummary = os.environ.get('enableParallelSummary')
-enalbeParentDocumentRetrival = os.environ.get('enalbeParentDocumentRetrival')
+enableParentDocumentRetrival = os.environ.get('enableParentDocumentRetrival')
 
 opensearch_account = os.environ.get('opensearch_account')
 opensearch_passwd = os.environ.get('opensearch_passwd')
@@ -408,32 +408,32 @@ def create_nori_index():
             "index.knn": True,
             "index.knn.algo_param.ef_search": 512,
             'analysis': {
-                'analyzer': {
-                    'my_analyzer': {
-                        'char_filter': ['html_strip'], 
-                        'tokenizer': 'nori',
-                        'filter': ['nori_number','lowercase','trim','my_nori_part_of_speech'],
-                        'type': 'custom'
-                    }
-                },
-                'tokenizer': {
-                    'nori': {
-                        'decompound_mode': 'mixed',
-                        'discard_punctuation': 'true',
-                        'type': 'nori_tokenizer'
-                    }
-                },
-                "filter": {
-                    "my_nori_part_of_speech": {
-                        "type": "nori_part_of_speech",
-                        "stoptags": [
-                                "E", "IC", "J", "MAG", "MAJ",
-                                "MM", "SP", "SSC", "SSO", "SC",
-                                "SE", "XPN", "XSA", "XSN", "XSV",
-                                "UNA", "NA", "VSV"
-                        ]
-                    }
-                }
+                #'analyzer': {
+                #    'my_analyzer': {
+                #        'char_filter': ['html_strip'], 
+                #        'tokenizer': 'nori',
+                #        'filter': ['nori_number','lowercase','trim','my_nori_part_of_speech'],
+                #        'type': 'custom'
+                #    }
+                #},
+                #'tokenizer': {
+                #    'nori': {
+                #        'decompound_mode': 'mixed',
+                #        'discard_punctuation': 'true',
+                #        'type': 'nori_tokenizer'
+                #    }
+                #},
+                #"filter": {
+                #    "my_nori_part_of_speech": {
+                #        "type": "nori_part_of_speech",
+                #        "stoptags": [
+                #                "E", "IC", "J", "MAG", "MAJ",
+                #                "MM", "SP", "SSC", "SSO", "SC",
+                #                "SE", "XPN", "XSA", "XSN", "XSV",
+                #                "UNA", "NA", "VSV"
+                #        ]
+                #    }
+                #}
             },
         },
         'mappings': {
@@ -488,6 +488,7 @@ def get_contexual_docs(whole_doc, splitted_docs):
     ])
 
     docs = []
+    contexualized_chunks = []
     for i, doc in enumerate(splitted_docs):        
         chat = get_contexual_retrieval_chat()
         
@@ -502,6 +503,7 @@ def get_contexual_docs(whole_doc, splitted_docs):
         # print('--> contexual chunk: ', response)
         output = response.content
         contextualized_chunk = output[output.find('<result>')+8:len(output)-9]
+        contexualized_chunks.append(contextualized_chunk)
         
         print(f"--> {i}: original_chunk: {doc.page_content}")
         print(f"--> {i}: contexualized_chunk: {contextualized_chunk}")
@@ -512,7 +514,7 @@ def get_contexual_docs(whole_doc, splitted_docs):
                 metadata=doc.metadata
             )
         )
-    return docs
+    return docs, contexualized_chunks
     
 def add_to_opensearch(docs, key):    
     if len(docs) == 0:
@@ -526,11 +528,12 @@ def add_to_opensearch(docs, key):
     delete_document_if_exist(metadata_key)
         
     ids = []
-    if enalbeParentDocumentRetrival == 'true':
+    if enableParentDocumentRetrival == 'true':
         parent_splitter = RecursiveCharacterTextSplitter(
             chunk_size=2000,
             chunk_overlap=100,
-            separators=["\n\n", "\n", ".", " ", ""],
+            #separators=["\n\n", "\n", ".", " ", ""],
+            separators=["\n\n", "\n", ""],
             length_function = len,
         )
         child_splitter = RecursiveCharacterTextSplitter(
@@ -544,8 +547,10 @@ def add_to_opensearch(docs, key):
         print('len(parent_docs): ', len(parent_docs))
         
         print('parent chunk[0]: ', parent_docs[0].page_content)
-        parent_docs = get_contexual_docs(docs[-1], parent_docs)
-        print('parent contextual chunk[0]: ', parent_docs[0].page_content)
+        
+        if enableContexualRetrieval == 'true':
+            parent_docs, contexualized_chunks = get_contexual_docs(docs[-1], parent_docs)
+            print('parent contextual chunk[0]: ', parent_docs[0].page_content)
                 
         if len(parent_docs):
             # print('parent_docs[0]: ', parent_docs[0])
@@ -554,34 +559,38 @@ def add_to_opensearch(docs, key):
             
             for i, doc in enumerate(parent_docs):
                 doc.metadata["doc_level"] = "parent"
-                # print(f"parent_docs[{i}]: {doc}")
+                print(f"parent_docs[{i}]: {doc}")
                     
             try:        
                 parent_doc_ids = vectorstore.add_documents(parent_docs, bulk_size = 10000)
                 print('parent_doc_ids: ', parent_doc_ids) 
                 print('len(parent_doc_ids): ', len(parent_doc_ids))
-                
-                child_docs = []
-                       
+                ids = parent_doc_ids
+                                
                 for i, doc in enumerate(parent_docs):
                     _id = parent_doc_ids[i]
                     sub_docs = child_splitter.split_documents([doc])
                     for _doc in sub_docs:
                         _doc.metadata["parent_doc_id"] = _id
-                        _doc.metadata["doc_level"] = "child"
-                        
-                    child_docs.extend(sub_docs)
-                # print('child_docs: ', child_docs)
-                
-                print('child chunk[0]: ', child_docs[0].page_content)
-                child_docs = get_contexual_docs(docs[-1], child_docs)
-                print('child contextual chunk[0]: ', child_docs[0].page_content)
-                
-                child_doc_ids = vectorstore.add_documents(child_docs, bulk_size = 10000)
-                print('child_doc_ids: ', child_doc_ids) 
-                print('len(child_doc_ids): ', len(child_doc_ids))
+                        _doc.metadata["doc_level"] = "child"                        
+                    print('sub_docs[0]: ', sub_docs[0].page_content)
                     
-                ids = parent_doc_ids+child_doc_ids
+                    if enableContexualRetrieval == 'true':
+                        docs = []
+                        for doc in sub_docs:
+                            docs.append(
+                                Document(
+                                    page_content=contexualized_chunks[i]+"\n\n"+doc.page_content,
+                                    metadata=doc.metadata
+                                )
+                            )
+                        sub_docs = docs
+                    
+                    child_doc_ids = vectorstore.add_documents(sub_docs, bulk_size = 10000)
+                    print('child_doc_ids: ', child_doc_ids)
+                    print('len(child_doc_ids): ', len(child_doc_ids))
+
+                    ids += child_doc_ids
             except Exception:
                 err_msg = traceback.format_exc()
                 print('error message: ', err_msg)                
@@ -590,7 +599,8 @@ def add_to_opensearch(docs, key):
         text_splitter = RecursiveCharacterTextSplitter(
             chunk_size=1000,
             chunk_overlap=100,
-            separators=["\n\n", "\n", ".", " ", ""],
+            #separators=["\n\n", "\n", ".", " ", ""],
+            separators=["\n\n", "\n", ""],
             length_function = len,
         ) 
         
@@ -600,8 +610,8 @@ def add_to_opensearch(docs, key):
         if len(documents):            
             if enableContexualRetrieval == 'true':                        
                 print('chunk[0]: ', documents[0].page_content)             
-                documents = get_contexual_docs(docs[-1], documents)
-                print('contextual chunk[0]: ', documents[0].page_content)  
+                documents, contexualized_chunks = get_contexual_docs(docs[-1], documents)
+                print('contextual chunks[0]: ', contexualized_chunks[0])  
             else:
                 print('documents[0]: ', documents[0])
             

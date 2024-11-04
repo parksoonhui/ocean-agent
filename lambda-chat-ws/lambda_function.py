@@ -30,6 +30,7 @@ from langgraph.constants import Send
 from opensearchpy import OpenSearch, RequestsHttpConnection, AWSV4SignerAuth
 from langchain_community.vectorstores.opensearch_vector_search import OpenSearchVectorSearch
 from langchain_aws import BedrockEmbeddings
+from langchain_community.vectorstores.faiss import FAISS
 
 from langgraph.graph.message import add_messages
 from langgraph.prebuilt import ToolNode
@@ -59,7 +60,10 @@ selected_chat = 0
 selected_multimodal = 0
 selected_embedding = 0
 useEnhancedSearch = False
-enableHybridSearch = 'false'
+enableHybridSearch = os.environ.get('enableHybridSearch')
+minDocSimilarity = 250
+grade_state = "LLM" # LLM, PRIORITY_SEARCH, OTHERS
+numberOfDocs = 2
     
 multi_region_models = [   # claude sonnet 3.0
     {   
@@ -94,6 +98,21 @@ multi_region_models = [   # claude sonnet 3.0
     }
 ]
 multi_region = 'disable'
+
+titan_embedding_v1 = [  # dimension = 1536
+  {
+    "bedrock_region": "us-west-2", # Oregon
+    "model_type": "titan",
+    "model_id": "amazon.titan-embed-text-v1"
+  },
+  {
+    "bedrock_region": "us-east-1", # N.Virginia
+    "model_type": "titan",
+    "model_id": "amazon.titan-embed-text-v1"
+  }
+]
+priority_search_embedding = titan_embedding_v1
+selected_ps_embedding = 0
 
 reference_docs = []
 
@@ -216,9 +235,9 @@ def tavily_search(query, k):
 # result = tavily_search('what is LangChain', 2)
 # print('search result: ', result)
 
-def reflash_opensearch_index():
+def refresh_opensearch_index():
     #########################
-    # opensearch index (reflash)
+    # opensearch index (refresh)
     #########################
     print(f"deleting opensearch index... {vectorIndexName}") 
     
@@ -614,36 +633,124 @@ def grade_documents_using_parallel_processing(question, documents):
     #print('filtered_docs: ', filtered_docs)
     return filtered_docs
 
+def get_ps_embedding():
+    global selected_ps_embedding
+    profile = priority_search_embedding[selected_ps_embedding]
+    bedrock_region =  profile['bedrock_region']
+    model_id = profile['model_id']
+    print(f'selected_ps_embedding: {selected_ps_embedding}, bedrock_region: {bedrock_region}, model_id: {model_id}')
+    
+    # bedrock   
+    boto3_bedrock = boto3.client(
+        service_name='bedrock-runtime',
+        region_name=bedrock_region, 
+        config=Config(
+            retries = {
+                'max_attempts': 30
+            }
+        )
+    )
+    
+    bedrock_ps_embedding = BedrockEmbeddings(
+        client=boto3_bedrock,
+        region_name = bedrock_region,
+        model_id = model_id
+    )  
+
+    selected_ps_embedding = selected_ps_embedding + 1
+    if selected_ps_embedding == len(priority_search_embedding):
+        selected_ps_embedding = 0
+
+    return bedrock_ps_embedding
+
+def priority_search(query, relevant_docs, minSimilarity):
+    excerpts = []
+    for i, doc in enumerate(relevant_docs):
+        #print('doc: ', doc)
+
+        content = doc.page_content
+        # print('content: ', content)
+
+        excerpts.append(
+            Document(
+                page_content=content,
+                metadata={
+                    'name': doc.metadata['name'],
+                    'url': doc.metadata['url'],
+                    'from': doc.metadata['from'],
+                    'order':i,
+                    'score':0
+                }
+            )
+        )
+    #print('excerpts: ', excerpts)
+
+    embeddings = get_ps_embedding()
+    vectorstore_confidence = FAISS.from_documents(
+        excerpts,  # documents
+        embeddings  # embeddings
+    )            
+    rel_documents = vectorstore_confidence.similarity_search_with_score(
+        query=query,
+        k=len(relevant_docs)
+    )
+
+    docs = []
+    for i, document in enumerate(rel_documents):
+        print(f'## Document(priority_search) query: {query}, {i+1}: {document}')
+
+        order = document[0].metadata['order']
+        name = document[0].metadata['name']
+        
+        score = document[1]
+        print(f"query: {query}, {order}: {name}, {score}")
+
+        relevant_docs[order].metadata['score'] = int(score)
+
+        if score < minSimilarity:
+            docs.append(relevant_docs[order])    
+    # print('selected docs: ', docs)
+
+    return docs
+
 def grade_documents(question, documents):
     print("###### grade_documents ######")
     
     filtered_docs = []
-    if multi_region == 'enable':  # parallel processing
-        print("start grading...")
-        filtered_docs = grade_documents_using_parallel_processing(question, documents)
-
-    else:
-        # Score each doc    
-        chat = get_chat()
-        retrieval_grader = get_retrieval_grader(chat)
-        for i, doc in enumerate(documents):
-            # print('doc: ', doc)
-            print_doc(i, doc)
-            
-            score = retrieval_grader.invoke({"question": question, "document": doc.page_content})
-            # print("score: ", score)
-            
-            grade = score.binary_score
-            # print("grade: ", grade)
-            # Document relevant
-            if grade.lower() == "yes":
-                print("---GRADE: DOCUMENT RELEVANT---")
-                filtered_docs.append(doc)
-            # Document not relevant
-            else:
-                print("---GRADE: DOCUMENT NOT RELEVANT---")
-                continue
+    print("start grading...")
+    print("grade_state: ", grade_state)
     
+    if grade_state == "LLM":
+        if multi_region == 'enable':  # parallel processing        
+            filtered_docs = grade_documents_using_parallel_processing(question, documents)
+
+        else:
+            # Score each doc    
+            chat = get_chat()
+            retrieval_grader = get_retrieval_grader(chat)
+            for i, doc in enumerate(documents):
+                # print('doc: ', doc)
+                print_doc(i, doc)
+                
+                score = retrieval_grader.invoke({"question": question, "document": doc.page_content})
+                # print("score: ", score)
+                
+                grade = score.binary_score
+                # print("grade: ", grade)
+                # Document relevant
+                if grade.lower() == "yes":
+                    print("---GRADE: DOCUMENT RELEVANT---")
+                    filtered_docs.append(doc)
+                # Document not relevant
+                else:
+                    print("---GRADE: DOCUMENT NOT RELEVANT---")
+                    continue
+    
+    elif grade_state == "PRIORITY_SEARCH":
+        filtered_docs = priority_search(question, documents, minDocSimilarity)
+    else:  # OTHERS
+        filtered_docs = documents
+        
     # print('len(docments): ', len(filtered_docs))    
     return filtered_docs
 
@@ -705,7 +812,8 @@ def get_documents_from_opensearch(vectorstore_opensearch, query, top_k):
     try:
         result = vectorstore_opensearch.similarity_search_with_score(
             query = query,
-            k = top_k*2,  
+            #k = top_k*2,  
+            k = top_k,  
             search_type="script_scoring",
             pre_filter={"term": {"metadata.doc_level": "child"}}
         )    
@@ -775,11 +883,83 @@ def get_parent_content(parent_doc_id):
     
     return source['text'], metadata['name'], url
 
+def lexical_search(query, top_k):
+    # lexical search (keyword)
+    min_match = 0
+    
+    query = {
+        "query": {
+            "bool": {
+                "must": [
+                    {
+                        "match": {
+                            "text": {
+                                "query": query,
+                                "minimum_should_match": f'{min_match}%',
+                                "operator":  "or",
+                            }
+                        }
+                    },
+                ],
+                "filter": [
+                ]
+            }
+        }
+    }
+
+    response = os_client.search(
+        body=query,
+        index=index_name
+    )
+    print('lexical query result: ', json.dumps(response))
+        
+    docs = []
+    for i, document in enumerate(response['hits']['hits']):
+        if i>=top_k: 
+            break
+                    
+        excerpt = document['_source']['text']
+        
+        name = document['_source']['metadata']['name']
+        # print('name: ', name)
+
+        page = ""
+        if "page" in document['_source']['metadata']:
+            page = document['_source']['metadata']['page']
+        
+        url = ""
+        if "url" in document['_source']['metadata']:
+            url = document['_source']['metadata']['url']            
+        
+        docs.append(
+                Document(
+                    page_content=excerpt,
+                    metadata={
+                        'name': name,
+                        'url': url,
+                        'page': page,
+                        'from': 'lexical'
+                    },
+                )
+            )
+    
+    for i, doc in enumerate(docs):
+        #print('doc: ', doc)
+        #print('doc content: ', doc.page_content)
+        
+        if len(doc.page_content)>=100:
+            text = doc.page_content[:100]
+        else:
+            text = doc.page_content            
+        print(f"--> lexical search doc[{i}]: {text}, metadata:{doc.metadata}")   
+        
+    return docs
+
 def get_answer_using_opensearch(chat, text, connectionId, requestId):    
     global reference_docs
     
     msg = ""
-    top_k = 4
+    top_k = numberOfDocs
     relevant_docs = []
     
     bedrock_embedding = get_embedding()
@@ -844,7 +1024,10 @@ def get_answer_using_opensearch(chat, text, connectionId, requestId):
                     },
                 )
             )
-
+    
+    if enableHybridSearch == 'true':
+        relevant_docs += lexical_search(text, top_k)    
+        
     isTyping(connectionId, requestId, "grading...")
     
     filtered_docs = grade_documents(text, relevant_docs) # grading
@@ -932,7 +1115,7 @@ def get_references(docs):
         
         if len(excerpt)<5000:
             if page:
-                reference = reference + f"{cnt}. {page}page in <a href={url} target=_blank>{name}</a>, {sourceType}, <a href=\"#\" onClick=\"alert(`{excerpt}`)\">관련문서</a>\n"
+                reference = reference + f"{cnt}. {page} page, <a href={url} target=_blank>{name}</a>, {sourceType}, <a href=\"#\" onClick=\"alert(`{excerpt}`)\">관련문서</a>\n"
             else:
                 reference = reference + f"{cnt}. <a href={url} target=_blank>{name}</a>, {sourceType}, <a href=\"#\" onClick=\"alert(`{excerpt}`)\">관련문서</a>\n"
             cnt = cnt + 1
@@ -1556,7 +1739,7 @@ def search_by_opensearch(keyword: str) -> str:
         http_auth=(opensearch_account, opensearch_passwd), # http_auth=awsauth,
     ) 
     
-    top_k = 2    
+    top_k = numberOfDocs
     relevant_docs = [] 
     if enableParentDocumentRetrival == 'true': # parent/child chunking
         relevant_documents = get_documents_from_opensearch(vectorstore_opensearch, keyword, top_k)
@@ -1610,8 +1793,8 @@ def search_by_opensearch(keyword: str) -> str:
                 )
             )
     
-    #if enableHybridSearch == 'true':
-    #    relevant_docs = relevant_docs + lexical_search_for_tool(keyword, top_k)
+    if enableHybridSearch == 'true':
+        relevant_docs += lexical_search(keyword, top_k)
     
     print('doc length: ', len(relevant_docs))
                 
@@ -1808,7 +1991,7 @@ def get_documents_from_opensearch_for_subject_company(vectorstore_opensearch, qu
     }          
     result = vectorstore_opensearch.similarity_search_with_score(
         query = query,
-        k = top_k*2,
+        k = top_k,
         search_type="script_scoring",
         pre_filter = boolean_filter
     )    
@@ -1857,7 +2040,7 @@ def get_documents_from_opensearch_for_subject_company(vectorstore_opensearch, qu
 def retrieve(query: str, subject_company: str):
     print(f'###### retrieve: {query} ######')
     
-    top_k = 2
+    top_k = numberOfDocs
     docs = []
     
     bedrock_embedding = get_embedding()
@@ -1901,8 +2084,7 @@ def retrieve(query: str, subject_company: str):
         boolean_filter = {
             "bool": {
                 "filter":[
-                    {"match" : {"metadata.subject_company":subject_company}},
-                    {"term" : {"metadata.doc_level":"child"}}
+                    {"match" : {"metadata.subject_company":subject_company}}
                 ]
             }
         }
@@ -1931,6 +2113,7 @@ def retrieve(query: str, subject_company: str):
                     },
                 )
             )
+    
     filtered_docs = grade_documents(query, docs) # grading
 
     filtered_docs = check_duplication(filtered_docs) # check duplication
@@ -2682,6 +2865,13 @@ def getResponse(connectionId, jsonBody):
     # print(f'selected_chat: {selected_chat}, bedrock_region: {bedrock_region}, modelId: {modelId}')
     # print('profile: ', profile)
     
+    global grade_state
+    if "grade" in jsonBody:
+        grade_state = jsonBody['grade']
+    else:
+        grade_state = 'NONE'
+    print('grade_state: ', grade_state)
+    
     global reference_docs, contentList
     reference_docs = []
     contentList = []
@@ -2720,11 +2910,11 @@ def getResponse(connectionId, jsonBody):
         msg += f"current model: {modelId}"
         print('model lists: ', msg)    
         
-    elif type == 'text' and body[:21] == 'reflash current index':
-        # reflash index
+    elif type == 'text' and body[:21] == 'refresh current index':
+        # refresh index
         isTyping(connectionId, requestId, "")
-        reflash_opensearch_index()
-        msg = "The index was reflashed in OpenSearch."
+        refresh_opensearch_index()
+        msg = "The index was refreshed in OpenSearch."
         sendResultMessage(connectionId, requestId, msg)
         
     else:             
@@ -2747,6 +2937,12 @@ def getResponse(connectionId, jsonBody):
                     msg = general_conversation(connectionId, requestId, chat, text)                  
                 
                 elif convType == 'rag-opensearch':   # RAG - Vector
+                    msg = get_answer_using_opensearch(chat, text, connectionId, requestId)
+                    
+                    if reference_docs:
+                        reference = get_references(reference_docs)
+                
+                elif convType == 'rag-opensearch-chat':   # RAG - Vector
                     revised_question = revise_question(connectionId, requestId, chat, text)     
                     print('revised_question: ', revised_question)  
                     
